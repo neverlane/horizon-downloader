@@ -44,18 +44,21 @@ class Progress:
             self.files += 1
             if skipped:
                 self.skipped += 1
-            self._draw(force=True)
+            self._draw()
 
-    def _draw(self, force: bool = False) -> None:
+    def _draw(self) -> None:
         now = time.monotonic()
-        if not force and now - self.last_draw < 0.1:
+        interval = 0.1 if self.is_tty else 5.0
+        if now - self.last_draw < interval:
             return
         self.last_draw = now
         mib = self.bytes / 1024 / 1024
         total_mib = self.total_bytes / 1024 / 1024
         percent = 100 * self.bytes / self.total_bytes if self.total_bytes else 100
+        filled = round(24 * min(percent, 100) / 100)
+        bar = "#" * filled + "-" * (24 - filled)
         line = (
-            f"\r{percent:6.2f}%  {mib:8.1f}/{total_mib:.1f} MiB  "
+            f"\r[{bar}] {percent:6.2f}%  {mib:7.1f}/{total_mib:.1f} MiB  "
             f"files {self.files}/{self.total_files}  cached {self.skipped}"
         )
         end = "" if self.is_tty else "\n"
@@ -63,7 +66,8 @@ class Progress:
 
     def close(self) -> None:
         with self.lock:
-            self._draw(force=True)
+            self.last_draw = 0.0
+            self._draw()
             if self.is_tty:
                 print(file=sys.stderr)
 
@@ -171,6 +175,25 @@ def download(
     raise AssertionError("unreachable")
 
 
+def current_os() -> str:
+    if sys.platform == "darwin":
+        return "osx"
+    if os.name == "nt":
+        return "windows"
+    return "linux"
+
+
+def library_allowed(library: dict) -> bool:
+    """Apply Mojang's OS rules in the same order as the official launcher."""
+    allowed = True
+    for rule in library.get("rules", []):
+        os_rule = rule.get("os")
+        matches = not os_rule or os_rule.get("name", current_os()) == current_os()
+        if matches:
+            allowed = rule["action"] == "allow"
+    return allowed
+
+
 def default_minecraft_dir() -> Path:
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "minecraft"
@@ -195,6 +218,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    print("=" * 66)
+    print("  HORIZON RESOURCE DOWNLOADER".center(66))
+    print("  Official Minecraft Java files from Mojang".center(66))
+    print("=" * 66)
     try:
         manifest = fetch_json(MANIFEST_URL)
         versions = {entry["id"]: entry for entry in manifest["versions"]}
@@ -227,6 +254,30 @@ def main() -> int:
         ]
         # Save metadata too, so other launchers can recognize the installation.
         metadata_path = root / "versions" / version_id / f"{version_id}.json"
+
+        # Horizon runs vanilla's data fixers during preparation and needs the
+        # libraries as well as the client and assets.
+        for library in version_meta.get("libraries", []):
+            if not library_allowed(library):
+                continue
+            downloads = library.get("downloads", {})
+            artifacts = []
+            if "artifact" in downloads:
+                artifacts.append(downloads["artifact"])
+            native_key = downloads.get("natives", {}).get(current_os())
+            if native_key:
+                native_key = native_key.replace("${arch}", "64")
+                if native_key in downloads.get("classifiers", {}):
+                    artifacts.append(downloads["classifiers"][native_key])
+            for artifact in artifacts:
+                tasks.append(
+                    (
+                        artifact["url"],
+                        root / "libraries" / artifact["path"],
+                        artifact["sha1"],
+                        artifact["size"],
+                    )
+                )
 
         index_meta = fetch_json(asset_index["url"])
         for name, item in index_meta["objects"].items():
